@@ -203,7 +203,7 @@ decl_module! {
 		pub fn deregister_enclave(origin) -> DispatchResult {
 			let enclave = ensure_signed(origin)?;
 			if <VerifiedEnclaves<T>>::contains_key(&enclave) {
-				debug::info!("[intel sgx]: deregister who={:?}", enclave);
+				debug::info!(target: "sgx", "deregister who={:?}", enclave);
 				<VerifiedEnclaves<T>>::remove(enclave.clone());
 				Self::deposit_event(RawEvent::EnclaveRemoved(enclave));
 				Ok(())
@@ -220,7 +220,7 @@ decl_module! {
 		) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
 			if <VerifiedEnclaves<T>>::contains_key(&enclave) {
-				debug::info!("[intel sgx]: call_enclave; who={:?} with payload={:?}", enclave, xt);
+				debug::info!(target: "sgx", "call_enclave; who={:?} with payload={:?}", enclave, xt);
 				let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 				waiting_calls.push((enclave, xt));
 				<WaitingEnclaveCalls<T>>::put(waiting_calls);
@@ -231,12 +231,13 @@ decl_module! {
 		}
 
 		#[weight = (100, Pays::No)]
-		fn enclave_call_dispatched(origin, waiting_call: (T::AccountId, Vec<u8>)) -> DispatchResult {
+		fn enclave_remove_waiting_call(origin, waiting_call: (T::AccountId, Vec<u8>)) -> DispatchResult {
+			debug::info!(target: "sgx", "remove waiting_call");
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			match waiting_calls.binary_search(&waiting_call) {
 				Ok(idx) => {
-					debug::info!("[intel sgx]: dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
+					debug::info!(target: "sgx", "dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
 					Self::deposit_event(RawEvent::EnclaveCallDispatched(waiting_call.0));
@@ -250,6 +251,7 @@ decl_module! {
 
 		#[weight = (100, Pays::No)]
 		fn prune_unverified_enclaves(origin) -> DispatchResult {
+			debug::info!(target: "sgx", "prune unverified enclaves");
 			let _who = ensure_signed(origin)?;
 			<UnverifiedEnclaves<T>>::kill();
 			Ok(())
@@ -258,7 +260,7 @@ decl_module! {
 		#[weight = (100, Pays::No)]
 		fn register_verified_enclave(origin, enclave_id: T::AccountId, enclave: Enclave) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
-			debug::info!("[intel sgx]: register_verified_enclave who={:?} with meta={:?}", enclave_id, enclave);
+			debug::info!(target: "sgx", "register_verified_enclave who={:?} with meta={:?}", enclave_id, enclave);
 			<VerifiedEnclaves<T>>::insert(enclave_id.clone(), enclave);
 			Self::deposit_event(RawEvent::EnclaveAdded(enclave_id));
 			Ok(())
@@ -271,42 +273,34 @@ decl_module! {
 		// TODO: use the offchain worker to re-verify the "trusted enclaves"
 		// every x block or maybe could be done in `on_initialize` or `on_finalize`
 		fn offchain_worker(block_number: T::BlockNumber) {
-			debug::trace!(target: "sgx", "[offchain_worker] START");
+			debug::trace!(target: "sgx", "[offchain_worker] START at block_number: {:?}", block_number);
+
+			let signer = Signer::<T, T::AuthorityId>::any_account();
+			if !signer.can_sign() {
+				debug::error!(target: "sgx", "No local accounts available. Consider adding one via `author_insertKey` RPC with keytype \"sgx!\"");
+				return;
+			}
+
 			let waiting_enclaves = <UnverifiedEnclaves<T>>::get();
+			debug::trace!(target: "sgx", "[offchain_worker] waiting enclaves to get registered={}", waiting_enclaves.len());
 			if !waiting_enclaves.is_empty() {
-				debug::trace!(target: "sgx", "[offchain_worker] {} unverified enclaves. Doing RA.", waiting_enclaves.len());
-				Self::remote_attest_unverified_enclaves().unwrap();
+				Self::remote_attest_unverified_enclaves(block_number, &signer).unwrap();
 			}
 
 			let waiting_calls = <WaitingEnclaveCalls<T>>::get();
+			debug::trace!(target: "sgx", "[offchain_worker] waiting enclave calls in queue={}", waiting_calls.len());
 			if !waiting_calls.is_empty() {
-				debug::trace!(target: "sgx", "[offchain_worker] {} calls in queue. Dispatching.", waiting_calls.len());
-				Self::dispatch_waiting_calls().unwrap();
+				Self::dispatch_waiting_calls(block_number, &signer).unwrap();
 			}
 
-			// Re-verify "verified enclaves" at least once every hour
-			// An enclave might get revoked or vulnerabilities might get detected
-			//
-			// Assuming the block production time is 1-20 seconds
-			if block_number % 2000.into() == 0.into() {
-				// TODO: implement me
-			}
-
-			// for enclave in <VerifiedEnclaves<T>>::iter() {
-			//     debug::info!("verified enclave={:?}", enclave);
-			// }
+			// TODO: re-verify "trusted enclaves"
 		}
 	}
 }
 
 impl<T: Trait> Module<T> {
-	fn remote_attest_unverified_enclaves() -> Result<(), &'static str> {
-		debug::trace!(target: "sgx", "[remote_attest_unverified_enclaves] START");
-		let signer = Signer::<T, T::AuthorityId>::all_accounts();
-		if !signer.can_sign() {
-			return Err("No local accounts available. Consider adding one via `author_insertKey` RPC with keytype \"sgx!\"");
-		}
-
+	fn remote_attest_unverified_enclaves(block_number: T::BlockNumber, signer: &Signer<T, T::AuthorityId, frame_system::offchain::ForAny>) -> Result<(), &'static str> {
+		debug::trace!(target: "sgx", "[remote_attest_unverified_enclaves] START at block_number: {:?}", block_number);
 		let mut verified = Vec::new();
 
 		for (enclave_sign, enclave_addr) in <UnverifiedEnclaves<T>>::get() {
@@ -339,12 +333,13 @@ impl<T: Trait> Module<T> {
 		}
 
 		signer.send_signed_transaction(|_account| {
+			debug::trace!(target: "sgx", "Sending signed transaction to prune unverified enclaves");
 			Call::prune_unverified_enclaves()
 		});
 
 		for (enclave_sign, enclave) in verified {
-			debug::trace!(target: "sgx", "Sending signed transaction to register enclave with AccountId={:?} on chain", enclave_sign);
 			signer.send_signed_transaction(|_account| {
+				debug::trace!(target: "sgx", "Sending signed transaction to register enclave with AccountId={:?} on chain", enclave_sign);
 				Call::register_verified_enclave(enclave_sign.clone(), enclave.clone())
 			});
 		}
@@ -352,12 +347,8 @@ impl<T: Trait> Module<T> {
 		Ok(())
 	}
 
-	fn dispatch_waiting_calls() -> Result<(), &'static str> {
-		debug::trace!(target: "sgx", "[dispatch_waiting_calls] START");
-		let signer = Signer::<T, T::AuthorityId>::all_accounts();
-		if !signer.can_sign() {
-			return Err("No local accounts available. Consider adding one via `author_insertKey` RPC with keytype \"sgx!\"");
-		}
+	fn dispatch_waiting_calls(block_number: T::BlockNumber, signer: &Signer<T, T::AuthorityId, frame_system::offchain::ForAny>) -> Result<(), &'static str> {
+		debug::trace!(target: "sgx", "[dispatch_waiting_calls] START at block_number: {:?}", block_number);
 
 		let mut dispatched = Vec::new();
 
@@ -384,7 +375,8 @@ impl<T: Trait> Module<T> {
 
 		for (enclave, xt) in dispatched {
 			signer.send_signed_transaction(|_account| {
-				Call::enclave_call_dispatched((enclave.clone(), xt.clone()))
+				debug::trace!(target: "sgx", "Sending signed transaction to remove dispatched enclave call");
+				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()))
 			});
 		}
 		Ok(())
