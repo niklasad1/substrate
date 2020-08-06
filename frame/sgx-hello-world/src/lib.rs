@@ -19,6 +19,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, Encode};
+use core::sync::atomic::{AtomicBool, Ordering};
 use frame_support::{
 	debug, decl_module, decl_storage, decl_event, decl_error,
 	dispatch::DispatchResult,
@@ -40,6 +41,9 @@ mod tests;
 
 /// Defines application identifier for crypto keys of this module.
 pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"sgx!");
+
+static REGISTRATION_BUSY: AtomicBool = AtomicBool::new(false);
+static CALL_BUSY: AtomicBool = AtomicBool::new(false);
 
 pub mod crypto {
 	use crate::KEY_TYPE;
@@ -239,6 +243,7 @@ decl_module! {
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			match waiting_calls.binary_search(&waiting_call) {
 				Ok(idx) => {
+					CALL_BUSY.store(false, Ordering::Relaxed);
 					debug::info!(target: "sgx", "dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
@@ -262,6 +267,7 @@ decl_module! {
 		#[weight = (100, Pays::No)]
 		fn register_verified_enclave(origin, enclave_id: T::AccountId, enclave: Enclave) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
+			REGISTRATION_BUSY.store(false, Ordering::Relaxed);
 			debug::info!(target: "sgx", "register_verified_enclave who={:?} with meta={:?}", enclave_id, enclave);
 			<VerifiedEnclaves<T>>::insert(enclave_id.clone(), enclave);
 			Self::deposit_event(RawEvent::EnclaveAdded(enclave_id));
@@ -285,13 +291,15 @@ decl_module! {
 
 			let waiting_enclaves = <UnverifiedEnclaves<T>>::get();
 			debug::trace!(target: "sgx", "[offchain_worker] waiting enclaves to get registered={}", waiting_enclaves.len());
-			if !waiting_enclaves.is_empty() {
+			if !waiting_enclaves.is_empty() && !REGISTRATION_BUSY.load(Ordering::Relaxed) {
+				REGISTRATION_BUSY.store(true, Ordering::Relaxed);
 				Self::remote_attest_unverified_enclaves(block_number, &signer).unwrap();
 			}
 
 			let waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			debug::trace!(target: "sgx", "[offchain_worker] waiting enclave calls in queue={}", waiting_calls.len());
-			if !waiting_calls.is_empty() {
+			if !waiting_calls.is_empty() && !CALL_BUSY.load(Ordering::Relaxed) {
+				CALL_BUSY.store(true, Ordering::Relaxed);
 				Self::dispatch_waiting_calls(block_number, &signer).unwrap();
 			}
 
