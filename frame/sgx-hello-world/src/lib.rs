@@ -290,14 +290,22 @@ decl_module! {
 			}
 
 			let waiting_enclaves = <UnverifiedEnclaves<T>>::get();
-			debug::trace!(target: "sgx", "[offchain_worker] waiting enclaves to get registered={}", waiting_enclaves.len());
-			if !waiting_enclaves.is_empty() && !REGISTRATION_BUSY.load(Ordering::Relaxed) {
-				REGISTRATION_BUSY.store(true, Ordering::Relaxed);
-				Self::remote_attest_unverified_enclaves(block_number, &signer).unwrap();
+			if !waiting_enclaves.is_empty() {
+				debug::trace!(target: "sgx", "[offchain_worker, #{:?}] There are {} enclaves awaiting registration", block_number, waiting_enclaves.len());
+				if !REGISTRATION_BUSY.load(Ordering::Relaxed) {
+					REGISTRATION_BUSY.store(true, Ordering::Relaxed);
+					debug::trace!(target: "sgx", "[offchain_worker, #{:?}] Doing RA.", block_number);
+					match Self::remote_attest_unverified_enclaves(block_number, &signer){
+						Ok(_) => debug::debug!(target: "sgx", "[offchain_worker, #{:?}] RA successful", block_number),
+						Err(e) => debug::warn!(target: "sgx", "[offchain_worker, #{:?}] RA error: {:?}", block_number, e)
+					};
+				} else {
+					debug::trace!(target: "sgx", "[offchain_worker, #{:?}] NOT doing RA – already in progress.", block_number);
+				}
 			}
 
 			let waiting_calls = <WaitingEnclaveCalls<T>>::get();
-			debug::trace!(target: "sgx", "[offchain_worker] waiting enclave calls in queue={}", waiting_calls.len());
+			debug::trace!(target: "sgx", "[offchain_worker, #{:?}] waiting enclave calls in queue={}", block_number, waiting_calls.len());
 			if !waiting_calls.is_empty() && !CALL_BUSY.load(Ordering::Relaxed) {
 				CALL_BUSY.store(true, Ordering::Relaxed);
 				Self::dispatch_waiting_calls(block_number, &signer).unwrap();
