@@ -254,7 +254,7 @@ decl_module! {
 					Ok(())
 				}
 				Err(_) => {
-					debug::info!(target: "sgx", "remove waiting_call failed={:?}", waiting_call);
+					debug::error!(target: "sgx", "remove waiting_call failed={:?}", waiting_call);
 					Err(Error::<T>::EnclaveNotFound.into())
 				}
 			}
