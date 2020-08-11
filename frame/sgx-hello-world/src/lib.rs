@@ -230,6 +230,7 @@ decl_module! {
 				debug::info!(target: "sgx", "call_enclave; who={:?} with payload={:?}", enclave, xt);
 				let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 				waiting_calls.push((enclave, xt));
+				waiting_calls.sort();
 				<WaitingEnclaveCalls<T>>::put(waiting_calls);
 				Ok(())
 			} else {
@@ -240,9 +241,9 @@ decl_module! {
 
 		#[weight = (100, Pays::No)]
 		fn enclave_remove_waiting_call(origin, waiting_call: (T::AccountId, Vec<u8>)) -> DispatchResult {
+			debug::trace!(target: "sgx", "remove waiting_call={:?}", waiting_call);
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
-			debug::info!(target: "sgx", "remove waiting_call={:?}", waiting_call);
 			CALL_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
 			match waiting_calls.binary_search(&waiting_call) {
 				Ok(idx) => {
@@ -253,7 +254,7 @@ decl_module! {
 					Ok(())
 				}
 				Err(_) => {
-					debug::info!(target: "sgx", "remove waiting_call failed for who={:?}", waiting_call.0);
+					debug::info!(target: "sgx", "remove waiting_call failed={:?}", waiting_call);
 					Err(Error::<T>::EnclaveNotFound.into())
 				}
 			}
