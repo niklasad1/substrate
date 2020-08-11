@@ -214,6 +214,7 @@ decl_module! {
 				Self::deposit_event(RawEvent::EnclaveRemoved(enclave));
 				Ok(())
 			} else {
+				debug::info!(target: "sgx", "deregister who={:?} failed", enclave);
 				Err(Error::<T>::EnclaveNotFound.into())
 			}
 		}
@@ -232,18 +233,19 @@ decl_module! {
 				<WaitingEnclaveCalls<T>>::put(waiting_calls);
 				Ok(())
 			} else {
+				debug::info!(target: "sgx", "call_enclave failed who={:?} not found", enclave);
 				Err(Error::<T>::EnclaveNotFound.into())
 			}
 		}
 
 		#[weight = (100, Pays::No)]
 		fn enclave_remove_waiting_call(origin, waiting_call: (T::AccountId, Vec<u8>)) -> DispatchResult {
-			debug::info!(target: "sgx", "remove waiting_call");
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
+			debug::info!(target: "sgx", "remove waiting_call={:?}", waiting_call);
+			CALL_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
 			match waiting_calls.binary_search(&waiting_call) {
 				Ok(idx) => {
-					CALL_BUSY.store(false, Ordering::Relaxed);
 					debug::info!(target: "sgx", "dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
@@ -251,6 +253,7 @@ decl_module! {
 					Ok(())
 				}
 				Err(_) => {
+					debug::info!(target: "sgx", "remove waiting_call failed for who={:?}", waiting_call.0);
 					Err(Error::<T>::EnclaveNotFound.into())
 				}
 			}
@@ -267,7 +270,7 @@ decl_module! {
 		#[weight = (100, Pays::No)]
 		fn register_verified_enclave(origin, enclave_id: T::AccountId, enclave: Enclave) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
-			REGISTRATION_BUSY.store(false, Ordering::Relaxed);
+			REGISTRATION_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
 			debug::info!(target: "sgx", "register_verified_enclave who={:?} with meta={:?}", enclave_id, enclave);
 			<VerifiedEnclaves<T>>::insert(enclave_id.clone(), enclave);
 			Self::deposit_event(RawEvent::EnclaveAdded(enclave_id));
@@ -292,10 +295,9 @@ decl_module! {
 			let waiting_enclaves = <UnverifiedEnclaves<T>>::get();
 			if !waiting_enclaves.is_empty() {
 				debug::trace!(target: "sgx", "[offchain_worker, #{:?}] There are {} enclaves awaiting registration", block_number, waiting_enclaves.len());
-				if !REGISTRATION_BUSY.load(Ordering::Relaxed) {
-					REGISTRATION_BUSY.store(true, Ordering::Relaxed);
+				if !REGISTRATION_BUSY.compare_and_swap(false, true, Ordering::Relaxed) {
 					debug::trace!(target: "sgx", "[offchain_worker, #{:?}] Doing RA.", block_number);
-					match Self::remote_attest_unverified_enclaves(block_number, &signer){
+					match Self::remote_attest_unverified_enclaves(block_number, &signer) {
 						Ok(_) => debug::debug!(target: "sgx", "[offchain_worker, #{:?}] RA successful", block_number),
 						Err(e) => debug::warn!(target: "sgx", "[offchain_worker, #{:?}] RA error: {:?}", block_number, e)
 					};
@@ -305,10 +307,16 @@ decl_module! {
 			}
 
 			let waiting_calls = <WaitingEnclaveCalls<T>>::get();
-			debug::trace!(target: "sgx", "[offchain_worker, #{:?}] waiting enclave calls in queue={}", block_number, waiting_calls.len());
-			if !waiting_calls.is_empty() && !CALL_BUSY.load(Ordering::Relaxed) {
-				CALL_BUSY.store(true, Ordering::Relaxed);
-				Self::dispatch_waiting_calls(block_number, &signer).unwrap();
+			if !waiting_calls.is_empty() {
+				debug::trace!(target: "sgx", "[offchain_worker, #{:?}] There are {} waiting enclave calls", block_number, waiting_calls.len());
+				if !CALL_BUSY.compare_and_swap(false, true, Ordering::Relaxed) {
+					match Self::dispatch_waiting_calls(block_number, &signer) {
+						Ok(_) => debug::debug!(target: "sgx", "[offchain_worker, #{:?}] enclave call successful", block_number),
+						Err(e) => debug::warn!(target: "sgx", "[offchain_worker, #{:?}] enclave call error: {:?}", block_number, e)
+					};
+				} else {
+					debug::trace!(target: "sgx", "[offchain_worker, #{:?}] not dispatching waiting enclave calls - already in progress", block_number);
+				}
 			}
 
 			// TODO: re-verify "trusted enclaves"
