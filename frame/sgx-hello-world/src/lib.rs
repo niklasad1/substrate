@@ -219,6 +219,7 @@ decl_module! {
 			}
 		}
 
+		/// Enqueue an encrypted extrinsic to be sent to the enclave/
 		#[weight = 100]
 		pub fn call_enclave(
 			origin,
@@ -245,6 +246,7 @@ decl_module! {
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			CALL_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
+
 			match waiting_calls.binary_search(&waiting_call) {
 				Ok(idx) => {
 					debug::info!(target: "sgx", "dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
@@ -281,11 +283,14 @@ decl_module! {
 		fn deposit_event() = default;
 
 		/// Offchain Worker entry point.
+		/// First checks for any pending enclave registration requests: if any, perform RA on each of them.
+		/// Next checks for any pending enclave calls: if any, call `dispatch_waiting_calls`.
 		//
 		// TODO: use the offchain worker to re-verify the "trusted enclaves"
 		// every x block or maybe could be done in `on_initialize` or `on_finalize`
 		fn offchain_worker(block_number: T::BlockNumber) {
 			debug::trace!(target: "sgx", "[offchain_worker] START at block_number: {:?}", block_number);
+
 
 			let signer = Signer::<T, T::AuthorityId>::any_account();
 			if !signer.can_sign() {
@@ -383,39 +388,67 @@ impl<T: Trait> Module<T> {
 		Ok(())
 	}
 
-	fn dispatch_waiting_calls(block_number: T::BlockNumber, signer: &Signer<T, T::AuthorityId, frame_system::offchain::ForAny>) -> Result<(), &'static str> {
+	fn dispatch_waiting_calls(
+		block_number: T::BlockNumber,
+		signer: &Signer<T, T::AuthorityId, frame_system::offchain::ForAny>
+	) -> Result<(), &'static str> {
 		debug::trace!(target: "sgx", "[dispatch_waiting_calls] START at block_number: {:?}", block_number);
-
+		let pending_calls = <WaitingEnclaveCalls<T>>::get();
+		debug::trace!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Pending enclave calls: {}", block_number, pending_calls.len());
 		let mut dispatched = Vec::new();
+		let mut fail_count = 0;
 
-		for (enclave_id, xt) in <WaitingEnclaveCalls<T>>::get() {
+		for (enclave_id, xt) in pending_calls {
 			if !<VerifiedEnclaves<T>>::contains_key(&enclave_id) {
 				continue;
 			}
 			let enclave = <VerifiedEnclaves<T>>::get(&enclave_id);
-			debug::trace!(target: "sgx", "[dispatch_waiting_calls] Enclave: {:?}, enclave id: {:?}", enclave, enclave_id);
+			debug::trace!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave: {:?}, enclave id: {:?}", block_number, enclave, enclave_id);
 			let mut full_address = Vec::new();
 			full_address.extend(&enclave.address);
 			full_address.extend("/enclave_call".as_bytes());
 			let enclave_addr = sp_std::str::from_utf8(&full_address).unwrap();
-			debug::info!(target: "sgx", "[intel sgx]: sending enclave_call to={:?} at address={:?}", enclave_id, enclave_addr);
-			if let Ok(Ok(response)) = http::Request::post(&enclave_addr, vec![&xt])
+			debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}]: sending enclave_call to={:?} at address={:?}", block_number, enclave_id, enclave_addr);
+
+			let enclave_request = http::Request::post(&enclave_addr, vec![&xt])
 				.add_header("substrate_sgx", "1.0")
 				.send()
-				.and_then(|r| Ok(r.wait())) {
-					dispatched.push((enclave_id, xt));
-					let body: Vec<u8> = response.body().collect();
-					debug::info!(target: "sgx", "dispatch_waiting_call response: {:?}", body);
+				.and_then(|r| Ok(r.wait()));
+			match enclave_request {
+				Ok(Ok(r)) if r.code >= 200 && r.code < 300 => {
+					debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave call was successful.", block_number);
+				},
+				Ok(Ok(response)) => {
+					fail_count += 1;
+					let body = response.body().collect::<Vec<u8>>();
+					let body = sp_std::str::from_utf8(&body).unwrap();
+					debug::warn!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave call failed with HTTP status: {}, body: {:?}",
+						block_number, response.code, body);
+				},
+				Ok(Err(e)) => {
+					fail_count += 1;
+					debug::warn!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Unexpected error: {:?}", block_number, e);
+				},
+				Err(e) => {
+					fail_count += 1;
+					debug::warn!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Transport error: {:?}", block_number, e);
 				}
+			}
+			dispatched.push((enclave_id, xt));
 		}
 
 		for (enclave, xt) in dispatched {
 			signer.send_signed_transaction(|_account| {
-				debug::trace!(target: "sgx", "Sending signed transaction to remove dispatched enclave call");
+				debug::trace!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Sending signed transaction to remove dispatched enclave call", block_number);
 				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()))
 			});
 		}
-		Ok(())
+
+		if fail_count == 0 {
+			Ok(())
+		} else {
+			Err("There were failed enclave calls")
+		}
 	}
 
 	/// Request a QUOTE from the enclave (proxied by the client)
