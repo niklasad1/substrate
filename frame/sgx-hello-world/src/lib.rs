@@ -31,6 +31,7 @@ use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
 	RuntimeDebug,
 	offchain::http,
+	traits::Hash,
 	transaction_validity::{TransactionValidity, TransactionSource}
 };
 use sp_std::vec::Vec;
@@ -169,8 +170,8 @@ decl_event!(
 	pub enum Event<T> where AccountId = <T as frame_system::Trait>::AccountId {
 		EnclaveAdded(AccountId),
 		EnclaveRemoved(AccountId),
-		EnclaveCallSuccess(AccountId),
-		EnclaveCallFailure(AccountId),
+		EnclaveCallSuccess(Vec<u8>),
+		EnclaveCallFailure(Vec<u8>),
 	}
 );
 
@@ -256,10 +257,11 @@ decl_module! {
 				Ok(idx) => {
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
+					let hash = T::Hashing::hash_of(&(&dispatched_call.0, &dispatched_call.1));
 					let event = if success {
-						RawEvent::EnclaveCallSuccess(dispatched_call.0)
+						RawEvent::EnclaveCallSuccess(hash.as_ref().to_vec())
 					} else {
-						RawEvent::EnclaveCallFailure(dispatched_call.0)
+						RawEvent::EnclaveCallFailure(hash.as_ref().to_vec())
 					};
 					Self::deposit_event(event);
 					Ok(())
