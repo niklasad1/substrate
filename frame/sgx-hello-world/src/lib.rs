@@ -31,6 +31,7 @@ use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
 	RuntimeDebug,
 	offchain::http,
+	traits::Hash,
 	transaction_validity::{TransactionValidity, TransactionSource}
 };
 use sp_std::vec::Vec;
@@ -169,7 +170,8 @@ decl_event!(
 	pub enum Event<T> where AccountId = <T as frame_system::Trait>::AccountId {
 		EnclaveAdded(AccountId),
 		EnclaveRemoved(AccountId),
-		EnclaveCallDispatched(AccountId),
+		EnclaveCallSuccess(Vec<u8>),
+		EnclaveCallFailure(Vec<u8>),
 	}
 );
 
@@ -241,22 +243,31 @@ decl_module! {
 		}
 
 		#[weight = (100, Pays::No)]
-		fn enclave_remove_waiting_call(origin, waiting_call: (T::AccountId, Vec<u8>)) -> DispatchResult {
-			debug::trace!(target: "sgx", "remove waiting_call={:?}", waiting_call);
+		fn enclave_remove_waiting_call(
+			origin,
+			dispatched_call: (T::AccountId, Vec<u8>),
+			success: bool
+		) -> DispatchResult {
+			debug::trace!(target: "sgx", "remove waiting_call dispatched by={:?} output was success={} with payload={:?}", dispatched_call.0, success, dispatched_call.1);
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			CALL_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
 
-			match waiting_calls.binary_search(&waiting_call) {
+			match waiting_calls.binary_search(&dispatched_call) {
 				Ok(idx) => {
-					debug::info!(target: "sgx", "dispatched enclave call who={:?} with payload={:?}", waiting_call.0, waiting_call.1);
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
-					Self::deposit_event(RawEvent::EnclaveCallDispatched(waiting_call.0));
+					let hash = T::Hashing::hash_of(&(&dispatched_call.0, &dispatched_call.1));
+					let event = if success {
+						RawEvent::EnclaveCallSuccess(hash.as_ref().to_vec())
+					} else {
+						RawEvent::EnclaveCallFailure(hash.as_ref().to_vec())
+					};
+					Self::deposit_event(event);
 					Ok(())
 				}
 				Err(_) => {
-					debug::error!(target: "sgx", "remove waiting_call failed={:?}", waiting_call);
+					debug::error!(target: "sgx", "dispatched call to unknown enclave={:?} or unknown payload", dispatched_call.0);
 					Err(Error::<T>::EnclaveNotFound.into())
 				}
 			}
@@ -410,6 +421,7 @@ impl<T: Trait> Module<T> {
 			let enclave_addr = sp_std::str::from_utf8(&full_address).unwrap();
 			debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}]: sending enclave_call to={:?} at address={:?}", block_number, enclave_id, enclave_addr);
 
+			let mut success = false;
 			let enclave_request = http::Request::post(&enclave_addr, vec![&xt])
 				.add_header("substrate_sgx", "1.0")
 				.send()
@@ -417,6 +429,7 @@ impl<T: Trait> Module<T> {
 			match enclave_request {
 				Ok(Ok(r)) if r.code >= 200 && r.code < 300 => {
 					debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave call was successful.", block_number);
+					success = true;
 				},
 				Ok(Ok(response)) => {
 					fail_count += 1;
@@ -434,13 +447,13 @@ impl<T: Trait> Module<T> {
 					debug::warn!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Transport error: {:?}", block_number, e);
 				}
 			}
-			dispatched.push((enclave_id, xt));
+			dispatched.push((enclave_id, xt, success));
 		}
 
-		for (enclave, xt) in dispatched {
+		for (enclave, xt, success) in dispatched {
 			signer.send_signed_transaction(|_account| {
 				debug::trace!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Sending signed transaction to remove dispatched enclave call", block_number);
-				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()))
+				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()), success)
 			});
 		}
 
