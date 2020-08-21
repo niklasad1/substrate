@@ -31,7 +31,7 @@ use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
 	RuntimeDebug,
 	offchain::http,
-	traits::Hash,
+	traits::{Hash, Header},
 	transaction_validity::{TransactionValidity, TransactionSource}
 };
 use sp_std::vec::Vec;
@@ -125,6 +125,34 @@ impl QuotingReport {
 	}
 }
 
+// TODO: implement `deserialization`
+#[derive(Encode, Decode, Default, Clone, PartialEq, Eq, RuntimeDebug)]
+pub struct AttestationReport {
+    id: Vec<u8>,
+    timestamp: Vec<u8>,
+    version: u64,
+    /// Possible values:
+    ///
+    /// "OK"
+    /// "SIGNATURE_INVALID–EPID"
+    /// "GROUP_REVOKED–TheEPID"
+    /// "SIGNATURE_REVOKED"
+    /// "KEY_REVOKED"
+    /// "SIGRL_VERSION_MISMATCH"
+    /// "GROUP_OUT_OF_DATE"
+    pub isv_enclave_quote_status: Vec<u8>,
+    isv_enclave_quote_body: Vec<u8>,
+    revocation_reason: Option<Vec<u8>>,
+    pse_manifest_status: Option<Vec<u8>>,
+    pse_manifest_hash: Option<Vec<u8>>,
+    pub platform_info_blob: Option<Vec<u8>>,
+    nonce: Option<Vec<u8>>,
+    // only for linkable
+    epid_pseudonym: Option<Vec<u8>>,
+    advisory_url: Option<Vec<u8>>,
+    advisory_ids: Option<Vec<Vec<u8>>>,
+}
+
 // Note: keep in sync with subxt_sgx_runtime::Enclave
 #[derive(Encode, Decode, Default, Clone, PartialEq, Eq, RuntimeDebug)]
 pub struct Enclave {
@@ -151,7 +179,9 @@ decl_error! {
 		/// The enclave is already registrered
         EnclaveAlreadyRegistered,
 		/// The enclave is not registrered
-		EnclaveNotFound
+		EnclaveNotFound,
+		/// The dispatched enclave call was not found
+		EnclaveCallNotFound,
     }
 }
 
@@ -246,29 +276,30 @@ decl_module! {
 		fn enclave_remove_waiting_call(
 			origin,
 			dispatched_call: (T::AccountId, Vec<u8>),
-			success: bool
+			execution_proof: Option<(T::BlockNumber, T::Hash, T::Hash)>,
 		) -> DispatchResult {
-			debug::trace!(target: "sgx", "remove waiting_call dispatched by={:?} output was success={} with payload={:?}", dispatched_call.0, success, dispatched_call.1);
+			debug::trace!(target: "sgx", "remove waiting_call dispatched by={:?} proof={:?} with payload={:?}", dispatched_call.0, execution_proof, dispatched_call.1);
 			let _who = ensure_signed(origin)?;
 			let mut waiting_calls = <WaitingEnclaveCalls<T>>::get();
 			CALL_BUSY.compare_and_swap(true, false, Ordering::Relaxed);
+			let call_digest = T::Hashing::hash_of(&(&dispatched_call.0, &dispatched_call.1)).as_ref().to_vec();
 
 			match waiting_calls.binary_search(&dispatched_call) {
 				Ok(idx) => {
 					waiting_calls.remove(idx);
 					<WaitingEnclaveCalls<T>>::put(waiting_calls);
-					let hash = T::Hashing::hash_of(&(&dispatched_call.0, &dispatched_call.1));
-					let event = if success {
-						RawEvent::EnclaveCallSuccess(hash.as_ref().to_vec())
+					let event = if Self::enclave_call_proof_is_valid(execution_proof) {
+						RawEvent::EnclaveCallSuccess(call_digest)
 					} else {
-						RawEvent::EnclaveCallFailure(hash.as_ref().to_vec())
+						RawEvent::EnclaveCallFailure(call_digest)
 					};
 					Self::deposit_event(event);
 					Ok(())
 				}
 				Err(_) => {
 					debug::error!(target: "sgx", "dispatched call to unknown enclave={:?} or unknown payload", dispatched_call.0);
-					Err(Error::<T>::EnclaveNotFound.into())
+					Self::deposit_event(RawEvent::EnclaveCallFailure(call_digest));
+					Err(Error::<T>::EnclaveCallNotFound.into())
 				}
 			}
 		}
@@ -301,7 +332,6 @@ decl_module! {
 		// every x block or maybe could be done in `on_initialize` or `on_finalize`
 		fn offchain_worker(block_number: T::BlockNumber) {
 			debug::trace!(target: "sgx", "[offchain_worker] START at block_number: {:?}", block_number);
-
 
 			let signer = Signer::<T, T::AuthorityId>::any_account();
 			if !signer.can_sign() {
@@ -342,6 +372,19 @@ decl_module! {
 }
 
 impl<T: Trait> Module<T> {
+	// The enclave claims that the extrinsic was included in a block
+	//
+	// Then verify that the actual block exist and that extrinsic root is the same.
+	fn enclave_call_proof_is_valid(proof: Option<(T::BlockNumber, T::Hash, T::Hash)>) -> bool {
+			let (block_number, block_hash, _xt_root) = match proof {
+				Some(proof) => proof,
+				None => return false,
+			};
+
+			// TODO: verify extrinsic root but how?!
+			block_hash == frame_system::Module::<T>::block_hash(block_number)
+	}
+
 	fn remote_attest_unverified_enclaves(block_number: T::BlockNumber, signer: &Signer<T, T::AuthorityId, frame_system::offchain::ForAny>) -> Result<(), &'static str> {
 		debug::trace!(target: "sgx", "[remote_attest_unverified_enclaves] START at block_number: {:?}", block_number);
 		let mut verified = Vec::new();
@@ -421,15 +464,23 @@ impl<T: Trait> Module<T> {
 			let enclave_addr = sp_std::str::from_utf8(&full_address).unwrap();
 			debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}]: sending enclave_call to={:?} at address={:?}", block_number, enclave_id, enclave_addr);
 
-			let mut success = false;
+			let mut execution_proof: Option<(T::BlockNumber, T::Hash, T::Hash)>  = None;
 			let enclave_request = http::Request::post(&enclave_addr, vec![&xt])
 				.add_header("substrate_sgx", "1.0")
 				.send()
 				.and_then(|r| Ok(r.wait()));
 			match enclave_request {
 				Ok(Ok(r)) if r.code >= 200 && r.code < 300 => {
-					debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave call was successful.", block_number);
-					success = true;
+					let body = r.body().collect::<Vec<u8>>();
+					debug::info!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Enclave call was successful", block_number);
+
+					execution_proof = match Decode::decode(&mut body.as_slice()) {
+						Ok(e) => Some(e),
+						Err(e) => {
+							debug::warn!(target: "sgx", "enclave execution proof could not be decoded={:?}", e);
+							None
+						}
+					};
 				},
 				Ok(Ok(response)) => {
 					fail_count += 1;
@@ -447,13 +498,13 @@ impl<T: Trait> Module<T> {
 					debug::warn!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Transport error: {:?}", block_number, e);
 				}
 			}
-			dispatched.push((enclave_id, xt, success));
+			dispatched.push((enclave_id, xt, execution_proof));
 		}
 
-		for (enclave, xt, success) in dispatched {
+		for (enclave, xt, execution_proof) in dispatched {
 			signer.send_signed_transaction(|_account| {
 				debug::trace!(target: "sgx", "[dispatch_waiting_calls, #{:?}] Sending signed transaction to remove dispatched enclave call", block_number);
-				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()), success)
+				Call::enclave_remove_waiting_call((enclave.clone(), xt.clone()), execution_proof)
 			});
 		}
 
